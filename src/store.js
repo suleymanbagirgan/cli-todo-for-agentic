@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig, catByProject } from './config.js';
 import { writeAtomic, withLock } from './io.js';
@@ -7,11 +7,13 @@ import { writeAtomic, withLock } from './io.js';
 const DIR = join(homedir(), '.joi-todo');
 const FILE = join(DIR, 'tasks.json');
 const LOG = join(DIR, 'events.jsonl');
-const LOCK = join(DIR, '.lock');
+// Lock lives in OS tmpdir (never synced by iCloud/Dropbox) to avoid
+// ghost locks between devices when the data dir is a synced symlink.
+const LOCK = join(tmpdir(), 'joi-todo.lock');
 
 function ensure() {
   if (!existsSync(DIR)) mkdirSync(DIR, { recursive: true });
-  if (!existsSync(FILE)) writeAtomic(FILE, JSON.stringify({ tasks: [], nextId: 1 }, null, 2));
+  if (!existsSync(FILE)) writeAtomic(FILE, JSON.stringify({ tasks: [], nextId: 1, stats: { completed: 0 } }, null, 2));
   if (!existsSync(LOG)) writeFileSync(LOG, '');
 }
 
@@ -96,6 +98,20 @@ function loadRaw() {
     const n = Number(m[2]);
     if (n > (data.categoryCounters[cat] || 0)) data.categoryCounters[cat] = n;
   }
+  // Reconcile lifetime completed counter. If missing or stale (e.g. edited
+  // externally), recompute from events once so the header stays accurate.
+  if (!data.stats || typeof data.stats.completed !== 'number') {
+    data.stats = { completed: 0 };
+    try {
+      const raw = readFileSync(LOG, 'utf8').trim();
+      if (raw) {
+        for (const line of raw.split('\n')) {
+          const e = JSON.parse(line);
+          if (e.type === 'toggle' && e.done) data.stats.completed += 1;
+        }
+      }
+    } catch {}
+  }
   return data;
 }
 
@@ -167,12 +183,19 @@ export function toggleTask(id) {
     const data = loadRaw();
     const t = data.tasks.find((x) => x.id === id);
     if (!t) return null;
+    const before = { done: t.done, status: t.status, doneAt: t.doneAt };
     const now = !t.done;
     t.done = now;
     t.status = now ? 'COMPLETE' : 'READY';
     t.doneAt = now ? new Date().toISOString() : null;
+    // Lifetime counter: matches count of `toggle && done` events over history,
+    // so cycles (complete → uncomplete → complete) count each completion.
+    if (now) {
+      data.stats = data.stats || { completed: 0 };
+      data.stats.completed += 1;
+    }
     save(data);
-    logEventUnlocked({ type: 'toggle', id, done: t.done, status: t.status });
+    logEventUnlocked({ type: 'toggle', id, done: t.done, status: t.status, before });
     return t;
   });
 }
@@ -239,9 +262,23 @@ export function undoLast() {
       case 'toggle': {
         const t = data.tasks.find((x) => x.id === last.id);
         if (t) {
-          t.done = !t.done;
-          t.status = t.done ? 'COMPLETE' : 'READY';
-          t.doneAt = t.done ? new Date().toISOString() : null;
+          if (last.before) {
+            // new format: restore explicit before-state
+            t.done = last.before.done;
+            t.status = last.before.status;
+            t.doneAt = last.before.doneAt ?? null;
+          } else {
+            // legacy fallback: flip
+            t.done = !t.done;
+            t.status = t.done ? 'COMPLETE' : 'READY';
+            t.doneAt = t.done ? new Date().toISOString() : null;
+          }
+        }
+        // Removing a completion event from the log means the lifetime
+        // count also drops by one; other toggle undos leave it alone.
+        if (last.done === true) {
+          data.stats = data.stats || { completed: 0 };
+          if (data.stats.completed > 0) data.stats.completed -= 1;
         }
         break;
       }

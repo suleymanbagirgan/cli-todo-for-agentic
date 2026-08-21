@@ -6,7 +6,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { load, addTask, updateTask, undoLast, readEvents } from './store.js';
+import { load, addTask, updateTask, undoLast } from './store.js';
 import { manifestos as defaultManifestos } from './manifestos.js';
 
 const personalManifestoPath = join(homedir(), '.joi-todo', 'manifestos.js');
@@ -92,15 +92,19 @@ export function App() {
   const [active, setActive] = useState(getActive());
   const [, setTick] = useState(0);
 
-  const computeShipped = () => readEvents().filter((e) => e.type === 'toggle' && e.done).length;
-  const [totalShipped, setTotalShipped] = useState(computeShipped());
+  const [totalShipped, setTotalShipped] = useState(data.stats?.completed ?? 0);
   const [now, setNow] = useState(new Date());
   useEffect(() => {
     const iv = setInterval(() => setNow(new Date()), 30000);
     return () => clearInterval(iv);
   }, []);
 
-  const refresh = () => { setData(load()); setActive(getActive()); setTotalShipped(computeShipped()); };
+  const refresh = () => {
+    const next = load();
+    setData(next);
+    setActive(getActive());
+    setTotalShipped(next.stats?.completed ?? 0);
+  };
 
   useEffect(() => {
     const stale = reconcileStaleActive();
@@ -131,6 +135,22 @@ export function App() {
   const openTasks = sortTasksGrouped(filtered.filter((t) => t.status !== 'COMPLETE'), order);
   const doneTasks = sortTasks(filtered.filter((t) => t.status === 'COMPLETE'));
   const tasks = [...openTasks, ...doneTasks];
+
+  // Precomputed maps for O(1) header stats during render.
+  const openCatCount = new Map();
+  const openProjCount = new Map();
+  for (const t of openTasks) {
+    const c = catMap.get(t.project);
+    openCatCount.set(c, (openCatCount.get(c) || 0) + 1);
+    const p = t.project || '(proje yok)';
+    openProjCount.set(p, (openProjCount.get(p) || 0) + 1);
+  }
+  const catByCode = new Map(config.categories.map((c) => [c.code, c]));
+  const doneCountByDate = new Map();
+  for (const t of doneTasks) {
+    const k = t.doneAt ? t.doneAt.slice(0, 10) : 'tarihsiz';
+    doneCountByDate.set(k, (doneCountByDate.get(k) || 0) + 1);
+  }
 
   useEffect(() => {
     if (cursor >= tasks.length && tasks.length > 0) setCursor(tasks.length - 1);
@@ -380,7 +400,7 @@ export function App() {
           `;
         }
         const cat = catMap.get(t.project);
-        const catObj = cat ? config.categories.find((c) => c.code === cat) : null;
+        const catObj = cat ? catByCode.get(cat) : null;
         const proj = t.project || '(proje yok)';
         const isDirect = isCategoryLevel(config, proj);
         const projPart = isDirect ? null : html`<${Text} key="brc-proj"><${Text} dimColor>   ·   <//><${Text} color="magenta">+${proj}<//><//>`;
@@ -440,7 +460,7 @@ export function App() {
                   const dkey = t.doneAt ? t.doneAt.slice(0, 10) : 'tarihsiz';
                   if (dkey !== lastDoneDate) {
                     if (lastDoneDate !== null) rows.push(html`<${Text} key=${'done-date-spc-' + dkey}> <//>`);
-                    const dayCount = doneTasks.filter((x) => (x.doneAt ? x.doneAt.slice(0,10) : 'tarihsiz') === dkey).length;
+                    const dayCount = doneCountByDate.get(dkey) || 0;
                     rows.push(html`
                       <${Box} key=${'done-date-' + dkey} paddingLeft=${2}>
                         <${Text}>
@@ -460,10 +480,10 @@ export function App() {
                   return;
                 }
                 const cat = catMap.get(t.project);
-                const catObj = cat ? config.categories.find((c) => c.code === cat) : null;
+                const catObj = cat ? catByCode.get(cat) : null;
                 if (cat !== lastCat) {
                   if (lastCat !== null) rows.push(html`<${Text} key=${'cat-spc-' + (cat || 'none')}> <//>`);
-                  const catOpen = openTasks.filter((x) => catMap.get(x.project) === cat).length;
+                  const catOpen = openCatCount.get(cat) || 0;
                   const mission = config.missions?.[cat];
                   rows.push(html`
                     <${Box} key=${'cat-' + (cat || 'none')} flexDirection="column">
@@ -481,7 +501,7 @@ export function App() {
                 const proj = t.project || '(proje yok)';
                 const isDirect = isCategoryLevel(config, proj);
                 if (!isDirect && proj !== lastProj) {
-                  const projOpen = openTasks.filter((x) => x.project === proj).length;
+                  const projOpen = openProjCount.get(proj) || 0;
                   rows.push(html`
                     <${Box} key=${'proj-' + (cat || 'none') + '-' + proj} paddingLeft=${2}>
                       <${Text}>
