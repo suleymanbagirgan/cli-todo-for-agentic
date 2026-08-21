@@ -1,0 +1,24 @@
+{
+  "name": "joi-todo",
+  "version": "0.1.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bin": {
+    "todo": "./bin/todo.js"
+  },
+  "dependencies": {
+    "chalk": "^6.0.0",
+    "htm": "^3.1.1",
+    "ink": "^7.1.1",
+    "ink-scroll-view": "^0.3.7",
+    "meow": "^14.1.0",
+    "react": "^19.2.8"
+  }
+}
