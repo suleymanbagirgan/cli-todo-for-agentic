@@ -1,6 +1,10 @@
 # joi todo
 
-Fast, opinionated terminal todo for founders and builders. Written in [Ink](https://github.com/vadimdemedes/ink).
+<p align="center">
+  <img src="docs/hero.png" alt="joi todo — CLI TODO for Agentic" width="100%" />
+</p>
+
+Fast, minimalist and agent-friendly CLI todo manager. Written in [Ink](https://github.com/vadimdemedes/ink).
 
 Runs fullscreen (alt-screen buffer), scrolls internally, shows a rotating daily manifesto, groups completed work by date, tracks time per task.
 
