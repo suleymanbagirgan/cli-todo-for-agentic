@@ -10,9 +10,20 @@ import { load, addTask, updateTask, undoLast, readEvents } from './store.js';
 import { manifestos as defaultManifestos } from './manifestos.js';
 
 const personalManifestoPath = join(homedir(), '.joi-todo', 'manifestos.js');
-const manifestos = existsSync(personalManifestoPath)
-  ? (await import(pathToFileURL(personalManifestoPath).href)).manifestos
-  : defaultManifestos;
+let manifestos = defaultManifestos;
+try {
+  if (existsSync(personalManifestoPath)) {
+    const personal = (await import(pathToFileURL(personalManifestoPath).href)).manifestos;
+    if (Array.isArray(personal) && personal.length > 0) manifestos = personal;
+  }
+} catch {
+  // bozuk kişisel dosya: default'a düş, app her koşulda açılmalı
+}
+
+const localDayIndex = () => {
+  const d = new Date();
+  return Math.floor((d - new Date(d.getFullYear(), 0, 1)) / 86400000) + d.getFullYear() * 366;
+};
 import { parseInput } from './parse.js';
 import { loadConfig, catByProject, getCategory, projectOrder, isCategoryLevel } from './config.js';
 import { sortTasks, sortTasksGrouped } from './sort.js';
@@ -322,7 +333,7 @@ export function App() {
           <${Text} color="greenBright" bold>${totalShipped}<//>
           <${Text} dimColor> tasks shipped all-time  ·  ${String(now.getDate()).padStart(2,'0')}.${String(now.getMonth()+1).padStart(2,'0')}.${now.getFullYear()} ${['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][now.getDay()]}  ·  ${Math.ceil((new Date(now.getFullYear() + 1, 0, 1) - now) / 86400000)} days left in ${now.getFullYear()}<//>
         <//>
-        <${Text} italic color="yellow">${'» ' + manifestos[Math.floor(Date.now() / 86400000) % manifestos.length]}<//>
+        <${Text} italic color="yellow">${'» ' + manifestos[localDayIndex() % manifestos.length]}<//>
       <//>
 
       <${Box}
