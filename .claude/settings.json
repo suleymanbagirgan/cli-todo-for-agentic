@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "bash /Users/sman/Documents/10-Work/Alpsuleiman/joi-todo/.claude/format-todos.sh 2>/dev/null || true",
+        "statusMessage": "joi-todo açık işleri yükleniyor...",
+        "timeout": 10
+      }
+    ],
+    "SessionEnd": [
+      {
+        "type": "command",
+        "command": "bash /Users/sman/Documents/10-Work/Alpsuleiman/joi-todo/.claude/format-todos.sh 2>/dev/null || true",
+        "statusMessage": "joi-todo oturumu kaydediliyor...",
+        "timeout": 10
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "bash /Users/sman/Documents/10-Work/Alpsuleiman/joi-todo/.claude/format-todos.sh 2>/dev/null || true",
+        "statusMessage": "joi-todo işleri kaydediliyor...",
+        "timeout": 10
+      }
+    ]
+  }
+}
