@@ -6,13 +6,13 @@ PROJECT="joi-todo"
 get_priority() {
     local msg="$1"
 
-    # !!! = büyük iş (new features, architecture, sistem kurulumu)
-    if [[ "$msg" =~ (Data\ layer|architecture|render|Initial|TUI|layer|terminal) ]]; then
+    # !!! = büyük iş (new features, architecture, sistem kurulumu, refactor)
+    if [[ "$msg" =~ (feat|feature|Data|layer|architecture|render|Initial|TUI|terminal|refactor|Refactor) ]]; then
         echo "!!!"
-    # !! = orta iş (fixes, hardening, config, setup)
-    elif [[ "$msg" =~ (fix|bug|harden|security|corrupt|setup) ]]; then
+    # !! = orta iş (fixes, hardening, config, setup, enhancement)
+    elif [[ "$msg" =~ (fix|Fix|bug|harden|security|corrupt|setup|Setup|enhancement|Enhancement|chore) ]]; then
         echo "!!"
-    # ! = küçük iş (docs, config files, testing)
+    # ! = küçük iş (docs, README, comment updates, typo)
     else
         echo "!"
     fi
@@ -23,13 +23,30 @@ tmpfile="/tmp/joi-todos-$$.tmp"
 
 today=$(date +%Y-%m-%d)
 
-# Uncommitted changes (WIP) - output directly if they exist
-if git status --porcelain 2>/dev/null | grep -qE '^[^ ]'; then
-    echo "0|!|TODOITEM: .gitignore: Add .claude/settings.local.json to ignore list +$PROJECT ! @${today}" >> "$tmpfile"
+# Uncommitted changes (WIP) - list each file as separate item
+staged_files=$(git diff --cached --name-only 2>/dev/null)
+unstaged_files=$(git diff --name-only 2>/dev/null)
+untracked_files=$(git ls-files --others --exclude-standard 2>/dev/null)
+
+if [[ -n "$staged_files" ]]; then
+    while read -r file; do
+        [[ -z "$file" ]] && continue
+        echo "0|!!|TODOITEM:  S  $file +$PROJECT !! @${today}" >> "$tmpfile"
+    done <<< "$staged_files"
 fi
 
-if git status --porcelain 2>/dev/null | grep -q "^?? \.claude/"; then
-    echo "0|!!|TODOITEM: .claude/ directory setup for Claude Code configuration +$PROJECT !! @${today}" >> "$tmpfile"
+if [[ -n "$unstaged_files" ]]; then
+    while read -r file; do
+        [[ -z "$file" ]] && continue
+        echo "0|!|TODOITEM:  M  $file +$PROJECT ! @${today}" >> "$tmpfile"
+    done <<< "$unstaged_files"
+fi
+
+if [[ -n "$untracked_files" ]]; then
+    while read -r file; do
+        [[ -z "$file" ]] && continue
+        echo "0|!|TODOITEM:  ?? $file +$PROJECT ! @${today}" >> "$tmpfile"
+    done <<< "$untracked_files"
 fi
 
 # Git commits (oldest first = reverse order of git log)
