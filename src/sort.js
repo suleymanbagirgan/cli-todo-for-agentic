@@ -47,6 +47,8 @@ export function sortTasksGrouped(tasks, projectOrder = []) {
     const ra = rank(a.project);
     const rb = rank(b.project);
     if (ra !== rb) return ra - rb;
+    const projCmp = (a.project || '').localeCompare(b.project || '');
+    if (projCmp !== 0) return projCmp;
     if (sa !== sb) return sa - sb;
     const pa = a.priority || 0;
     const pb = b.priority || 0;

@@ -161,6 +161,8 @@ export function App() {
   let overhead = 17;
   if (flash) overhead += 2;
   if (mode === 'add' || mode === 'edit') overhead += 5;
+  if (mode === 'filter') overhead += 4;
+  if (mode === 'picker') overhead += 4 + config.projects.length;
   const scrollHeight = Math.max(3, termRows - overhead);
 
   const cursorTaskId = tasks[cursor]?.id ?? null;
@@ -349,8 +351,8 @@ export function App() {
   }
 
   return html`
-    <${Box} flexDirection="column" padding=${1}>
-      <${Box} flexDirection="column" paddingX=${1}>
+    <${Box} flexDirection="column" padding=${1} height=${termRows - 1} overflow="hidden">
+      <${Box} flexDirection="column" paddingX=${1} flexShrink=${0}>
         <${Box} justifyContent="space-between">
           <${Text}>
             <${Text} color="greenBright" bold>◆ JOI<//>
@@ -361,11 +363,11 @@ export function App() {
             ${openCount} açık  ·  ${doneCount} bitti
           <//>
         <//>
-        <${Text} dimColor>
-          <${Text} color="greenBright" bold>${totalShipped}<//>
+        <${Text} dimColor wrap="truncate-end">
+          <${Text} color="greenBright" bold>${Math.max(totalShipped, doneCount)}<//>
           <${Text} dimColor> tasks shipped all-time  ·  ${String(now.getDate()).padStart(2,'0')}.${String(now.getMonth()+1).padStart(2,'0')}.${now.getFullYear()} ${['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][now.getDay()]}  ·  ${Math.ceil((new Date(now.getFullYear() + 1, 0, 1) - now) / 86400000)} days left in ${now.getFullYear()}<//>
         <//>
-        <${Text} italic color="yellow">${'» ' + manifestos[localDayIndex() % manifestos.length]}<//>
+        <${Text} italic color="yellow" wrap="truncate-end">${'» ' + manifestos[localDayIndex() % manifestos.length]}<//>
       <//>
 
       <${Box}
@@ -373,9 +375,10 @@ export function App() {
         borderStyle="round"
         borderColor=${active ? 'green' : 'gray'}
         paddingX=${2}
+        flexShrink=${0}
       >
         ${active && activeTask ? html`
-          <${Text}>
+          <${Text} wrap="truncate-end">
             <${Text} color="greenBright" bold>▶  <//>
             <${Text} color="greenBright" bold>${formatBigTimer(elapsedSeconds(active))}<//>
             <${Text} dimColor>    <//>
@@ -384,7 +387,7 @@ export function App() {
             ${activeTask.project ? html`<${Text} color="magenta">    +${activeTask.project}<//>` : ''}
           <//>
         ` : html`
-          <${Text} dimColor>
+          <${Text} dimColor wrap="truncate-end">
             <${Text}>○  hazır<//>
             <${Text}>     ·  bir görev seç, <//>
             <${Text} color="cyan">s<//>
@@ -402,8 +405,8 @@ export function App() {
             ? (() => { const d = new Date(t.doneAt); return `${String(d.getDate()).padStart(2,'0')}.${String(d.getMonth()+1).padStart(2,'0')}.${d.getFullYear()} ${['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d.getDay()]}`; })()
             : 'tarihsiz';
           return html`
-            <${Box} marginTop=${1} paddingX=${1}>
-              <${Text}>
+            <${Box} marginTop=${1} paddingX=${1} flexShrink=${0}>
+              <${Text} wrap="truncate-end">
                 <${Text} color="greenBright" bold>◆ SHIPPED<//>
                 <${Text} dimColor>   ·   <//>
                 <${Text} color="cyan" bold>${label}<//>
@@ -417,8 +420,8 @@ export function App() {
         const isDirect = isCategoryLevel(config, proj);
         const projPart = isDirect ? null : html`<${Text} key="brc-proj"><${Text} dimColor>   ·   <//><${Text} color="magenta">+${proj}<//><//>`;
         return html`
-          <${Box} marginTop=${1} paddingX=${1}>
-            <${Text}>
+          <${Box} marginTop=${1} paddingX=${1} flexShrink=${0}>
+            <${Text} wrap="truncate-end">
               <${Text} key="brc-cat" bold color="cyan">━━ ${cat || '?'}<//>
               <${Text} key="brc-catname" color="magenta">  ${catObj?.name || ''}<//>
               ${projPart}
@@ -578,15 +581,15 @@ export function App() {
         <${Box} marginTop=${1}><${Text} color="yellow">${flash}<//><//>
       `}
 
-      <${Box} marginTop=${1} borderStyle="single" borderColor="gray" paddingX=${1}>
-        <${Text} dimColor>
+      <${Box} marginTop=${1} borderStyle="single" borderColor="gray" paddingX=${1} flexShrink=${0}>
+        <${Text} dimColor wrap="truncate-end">
           ${mode === 'add' || mode === 'edit'
             ? 'enter: kaydet · tab: proje · esc: iptal'
             : mode === 'picker'
             ? '1-9/j/k: gez · enter: seç · esc: iptal'
             : mode === 'filter'
             ? 'enter: uygula · tab: proje · esc: iptal'
-            : 'a: ekle · e: düzenle · s: start · h: hold · c: complete · d: sil · u: geri al · /: filtre · O: momentum · j/k: gez · q: çık'}
+            : 'a ekle · e düzenle · s start · h hold · c bitir · d sil · u geri al · / filtre · O momentum · q çık'}
         <//>
       <//>
     <//>
