@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { load, addTask, updateTask, undoLast } from './store.js';
+import { Dashboard } from './Dashboard.js';
 import { manifestos as defaultManifestos } from './manifestos.js';
 
 const personalManifestoPath = join(homedir(), '.joi-todo', 'manifestos.js');
@@ -206,6 +207,8 @@ export function App() {
   useInput((rawCh, key) => {
     const ch = typeof rawCh === 'string' ? rawCh : '';
     const lc = ch.toLowerCase();
+    if (mode === 'dashboard') { setMode('list'); return; }
+
     if (mode === 'picker') {
       if (key.escape) { setMode(prevMode); return; }
       if (key.return) {
@@ -330,11 +333,20 @@ export function App() {
     if (ch === '/') { setInput(''); setMode('filter'); return; }
     if (ch === 'F') { setFilter(null); setFlash('filtre kaldırıldı'); }
     if (ch === 'r') refresh();
+    if (ch === 'O') { setMode('dashboard'); return; }
   });
 
   const activeTask = active ? allTasks.find((t) => t.id === active.id) : null;
   const openCount = allTasks.filter((t) => t.status !== 'COMPLETE').length;
   const doneCount = allTasks.filter((t) => t.status === 'COMPLETE').length;
+
+  if (mode === 'dashboard') {
+    return html`<${Dashboard}
+      data=${data}
+      totalShipped=${totalShipped}
+      quote=${manifestos[(localDayIndex() + 17) % manifestos.length]}
+    /></`;
+  }
 
   return html`
     <${Box} flexDirection="column" padding=${1}>
@@ -574,7 +586,7 @@ export function App() {
             ? '1-9/j/k: gez · enter: seç · esc: iptal'
             : mode === 'filter'
             ? 'enter: uygula · tab: proje · esc: iptal'
-            : 'a: ekle · e: düzenle · s: start · h: hold · c: complete · d: sil · u: geri al · /: filtre · j/k/↑↓: gez · g/G: baş/son · ^D/^U: hızlı · q: çık'}
+            : 'a: ekle · e: düzenle · s: start · h: hold · c: complete · d: sil · u: geri al · /: filtre · O: momentum · j/k: gez · q: çık'}
         <//>
       <//>
     <//>
