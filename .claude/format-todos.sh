@@ -1,47 +1,67 @@
 #!/bin/bash
-# Auto-list all work: uncommitted changes + commits with priorities
+# Auto-list all work: uncommitted changes + commits, priority-sorted
 
 PROJECT="joi-todo"
 today=$(date +%Y-%m-%d)
+tmpfile=$(mktemp)
 
 get_priority() {
     local msg="$1"
-    if [[ "$msg" =~ (feat|feature|Data|layer|architecture|render|Initial|TUI|terminal|refactor|Refactor) ]]; then
-        echo "!!!"
-    elif [[ "$msg" =~ (fix|Fix|bug|harden|security|corrupt|setup|Setup|enhancement|Enhancement|chore|improve|Improve|enhance|Enhance) ]]; then
-        echo "!!"
+    if [[ "$msg" =~ (feat|feature|Data|layer|architecture|render|Initial|TUI|terminal) ]]; then
+        echo "3"  # !!! = priority 3
+    elif [[ "$msg" =~ (fix|bug|harden|security|corrupt|refactor|Refactor|setup|enhancement|chore|improve|enhance) ]]; then
+        echo "2"  # !! = priority 2
     else
-        echo "!"
+        echo "1"  # ! = priority 1
     fi
 }
 
+priority_badge() {
+    case "$1" in
+        3) echo "!!!" ;;
+        2) echo "!!" ;;
+        *) echo "!" ;;
+    esac
+}
+
+# Collect all items with priority prefix for sorting
 {
-    # Staged changes
+    # 1. Staged changes (highest priority for uncommitted work)
     git diff --cached --name-only 2>/dev/null | while read -r file; do
-        [[ -n "$file" ]] && echo "TODOITEM:  S  $file +$PROJECT !! @${today}"
+        [[ -n "$file" ]] && echo "3|TODOITEM:  S  $file +$PROJECT !!!"
     done
 
-    # Modified files
+    # 2. Modified files (medium priority for uncommitted work)
     git diff --name-only 2>/dev/null | while read -r file; do
-        [[ -n "$file" ]] && echo "TODOITEM:  M  $file +$PROJECT ! @${today}"
+        [[ -n "$file" ]] && echo "2|TODOITEM:  M  $file +$PROJECT !!"
     done
 
-    # Untracked
+    # 3. Untracked (medium-low priority)
     git ls-files --others --exclude-standard 2>/dev/null | while read -r file; do
-        [[ -n "$file" ]] && echo "TODOITEM:  ?? $file +$PROJECT ! @${today}"
+        [[ -n "$file" ]] && echo "2|TODOITEM:  ?? $file +$PROJECT !!"
     done
 
-    # Commits with file changes
+    # 4. Commits (sorted by priority from msg)
     git log --reverse --format="%h|%ai|%s" 2>/dev/null | while IFS='|' read -r hash date_time msg; do
         [[ -z "$hash" ]] && continue
         date=$(echo "$date_time" | cut -d' ' -f1)
         priority=$(get_priority "$msg")
+        badge=$(priority_badge "$priority")
         files=$(git show --name-only --pretty="" "$hash" 2>/dev/null | wc -l)
-        echo "TODOITEM: $msg +$PROJECT ${priority} @${date} ($files changed)"
-
-        # Show affected files
-        git show --name-status --pretty="" "$hash" 2>/dev/null | while read -r line; do
-            [[ -n "$line" ]] && echo "  → $line"
-        done
+        echo "${priority}|TODOITEM: $msg +$PROJECT ${badge} @${date} ($files changed)"
     done
-}
+} | sort -rn -t'|' -k1 | cut -d'|' -f2- > "$tmpfile"
+
+output=$(cat "$tmpfile")
+
+# Print to stdout (for hook capture in system-reminder)
+echo "$output"
+
+# Also persist to .todos.md for persistent reference
+{
+    echo "# joi-todo İş Listesi — $(date '+%Y-%m-%d %H:%M')"
+    echo ""
+    echo "$output"
+} > .claude/.todos.md
+
+rm -f "$tmpfile"
