@@ -255,6 +255,36 @@ export function addTask(parsed) {
   });
 }
 
+// Records finished work captured from an agent session. `meta.turnId`
+// makes it idempotent: replaying the same transcript never duplicates.
+export function logWork({ text, project = null, meta }) {
+  return tx(() => {
+    const data = loadRaw();
+    const existing = data.tasks.find((t) => t.meta?.turnId === meta.turnId);
+    if (existing) return existing;
+    const cfg = loadConfig();
+    const now = new Date().toISOString();
+    const task = {
+      ...makeTask({ text, project }),
+      id: Math.max(data.nextId, ...data.tasks.map((t) => t.id + 1)),
+      status: 'COMPLETE',
+      done: true,
+      createdAt: meta.startedAt || now,
+      doneAt: meta.endedAt || now,
+      source: 'agent',
+      meta,
+    };
+    task.code = nextCode(data, project, cfg);
+    data.tasks.push(task);
+    data.nextId = task.id + 1;
+    data.stats = data.stats || { completed: 0 };
+    data.stats.completed += 1;
+    save(data);
+    logEventUnlocked({ type: 'worklog', task: { ...task } });
+    return task;
+  });
+}
+
 export function toggleTask(id) {
   return tx(() => {
     const data = loadRaw();
@@ -326,7 +356,8 @@ export function undoLast() {
     const data = loadRaw();
 
     switch (last.type) {
-      case 'add': {
+      case 'add':
+      case 'worklog': {
         const idx = data.tasks.findIndex((x) => x.id === last.task.id);
         if (idx !== -1) data.tasks.splice(idx, 1);
         if (data.nextId === last.task.id + 1) data.nextId = last.task.id;
