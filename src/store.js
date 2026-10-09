@@ -1,8 +1,8 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig, catByProject } from './config.js';
-import { writeAtomic, withLock } from './io.js';
+import { writeAtomic, withLock, ensureDownloaded } from './io.js';
 
 const DIR = join(homedir(), '.joi-todo');
 const FILE = join(DIR, 'tasks.json');
@@ -10,15 +10,97 @@ const LOG = join(DIR, 'events.jsonl');
 // Lock lives in OS tmpdir (never synced by iCloud/Dropbox) to avoid
 // ghost locks between devices when the data dir is a synced symlink.
 const LOCK = join(tmpdir(), 'joi-todo.lock');
+// iCloud names the losing side of a cross-device write conflict "tasks 2.json".
+const CONFLICT_TASKS = /^tasks \d+\.json$/;
+const CONFLICT_EVENTS = /^events \d+\.jsonl$/;
 
 function ensure() {
   if (!existsSync(DIR)) mkdirSync(DIR, { recursive: true });
-  if (!existsSync(FILE)) writeAtomic(FILE, JSON.stringify({ tasks: [], nextId: 1, stats: { completed: 0 } }, null, 2));
-  if (!existsSync(LOG)) writeFileSync(LOG, '');
+  if (!ensureDownloaded(FILE)) writeAtomic(FILE, JSON.stringify({ tasks: [], nextId: 1, stats: { completed: 0 } }, null, 2));
+  if (!ensureDownloaded(LOG)) writeFileSync(LOG, '');
 }
 
 function tx(fn) {
-  return withLock(LOCK, fn);
+  return withLock(LOCK, () => {
+    resolveConflicts();
+    return fn();
+  });
+}
+
+const touchedAt = (t) => t.updatedAt || t.doneAt || t.createdAt || '';
+
+function reconcileCounters(data, tasks) {
+  data.categoryCounters = data.categoryCounters || {};
+  for (const t of tasks) {
+    const m = /^([A-Z]+)-(\d+)$/.exec(t.code || '');
+    if (!m) continue;
+    const n = Number(m[2]);
+    if (n > (data.categoryCounters[m[1]] || 0)) data.categoryCounters[m[1]] = n;
+  }
+}
+
+// Same id + same createdAt → same task, newest edit wins. Same id but a
+// different createdAt → both devices added a task concurrently, so the
+// incoming one gets a fresh id and code instead of being dropped.
+function mergeTasks(data, other, cfg) {
+  const byId = new Map(data.tasks.map((t) => [t.id, t]));
+  const incoming = [];
+  for (const t of other.tasks || []) {
+    const mine = byId.get(t.id);
+    if (!mine) incoming.push({ ...t });
+    else if (mine.createdAt !== t.createdAt) incoming.push({ ...t, id: null });
+    else if (touchedAt(t) > touchedAt(mine)) Object.assign(mine, t);
+  }
+  reconcileCounters(data, [...data.tasks, ...incoming]);
+  const usedCodes = new Set(data.tasks.map((t) => t.code).filter(Boolean));
+  let maxId = Math.max(0, ...data.tasks.map((t) => t.id || 0), ...incoming.map((t) => t.id || 0));
+  for (const t of incoming) {
+    if (t.id === null) t.id = ++maxId;
+    if (!t.code || usedCodes.has(t.code)) t.code = nextCode(data, t.project, cfg);
+    usedCodes.add(t.code);
+    data.tasks.push(t);
+  }
+  data.tasks.sort((a, b) => a.id - b.id);
+  data.nextId = Math.max(data.nextId || 1, other.nextId || 1, maxId + 1);
+  data.stats = { completed: Math.max(data.stats?.completed || 0, other.stats?.completed || 0) };
+}
+
+function resolveConflicts() {
+  let names;
+  try { names = readdirSync(DIR); } catch { return; }
+  const taskCopies = names.filter((n) => CONFLICT_TASKS.test(n));
+  const eventCopies = names.filter((n) => CONFLICT_EVENTS.test(n));
+  if (taskCopies.length === 0 && eventCopies.length === 0) return;
+  ensure();
+
+  if (taskCopies.length) {
+    const data = JSON.parse(readFileSync(FILE, 'utf8'));
+    const cfg = loadConfig();
+    const merged = [];
+    for (const name of taskCopies) {
+      const path = join(DIR, name);
+      try {
+        mergeTasks(data, JSON.parse(readFileSync(path, 'utf8')), cfg);
+        merged.push(path);
+      } catch {}
+    }
+    writeAtomic(FILE, JSON.stringify(data, null, 2));
+    for (const path of merged) unlinkSync(path);
+  }
+
+  if (eventCopies.length) {
+    const lines = new Set(readFileSync(LOG, 'utf8').split('\n').filter(Boolean));
+    for (const name of eventCopies) {
+      const path = join(DIR, name);
+      for (const line of readFileSync(path, 'utf8').split('\n')) if (line) lines.add(line);
+      unlinkSync(path);
+    }
+    const sorted = [...lines]
+      .map((line) => { try { return { line, ts: JSON.parse(line).ts || '' }; } catch { return null; } })
+      .filter(Boolean)
+      .sort((a, b) => a.ts.localeCompare(b.ts));
+    writeAtomic(LOG, sorted.map((e) => e.line).join('\n') + '\n');
+  }
 }
 
 function migrateTask(t) {
@@ -63,6 +145,7 @@ export function addTimeSpent(id, seconds) {
     const t = data.tasks.find((x) => x.id === id);
     if (!t) return null;
     t.timeSpent = (t.timeSpent || 0) + seconds;
+    t.updatedAt = new Date().toISOString();
     save(data);
     return t;
   });
@@ -75,6 +158,7 @@ export function setStatus(id, status) {
     if (!t) return null;
     const before = t.status;
     t.status = status;
+    t.updatedAt = new Date().toISOString();
     t.done = status === 'COMPLETE';
     t.doneAt = status === 'COMPLETE' ? new Date().toISOString() : null;
     save(data);
@@ -89,15 +173,7 @@ function loadRaw() {
   data.tasks = data.tasks.map((t) => migrateTask({ ...t }));
   const maxId = data.tasks.reduce((m, t) => Math.max(m, t.id || 0), 0);
   data.nextId = Math.max(data.nextId || 1, maxId + 1);
-  data.categoryCounters = data.categoryCounters || {};
-  for (const t of data.tasks) {
-    if (!t.code) continue;
-    const m = /^([A-Z]+)-(\d+)$/.exec(t.code);
-    if (!m) continue;
-    const cat = m[1];
-    const n = Number(m[2]);
-    if (n > (data.categoryCounters[cat] || 0)) data.categoryCounters[cat] = n;
-  }
+  reconcileCounters(data, data.tasks);
   // Reconcile lifetime completed counter. If missing or stale (e.g. edited
   // externally), recompute from events once so the header stays accurate.
   if (!data.stats || typeof data.stats.completed !== 'number') {
@@ -116,7 +192,7 @@ function loadRaw() {
 }
 
 export function load() {
-  return loadRaw();
+  return tx(loadRaw);
 }
 
 export function save(data) {
@@ -157,6 +233,7 @@ function makeTask({ text, project = null, priority = 0, due = null }) {
     done: false,
     timeSpent: 0,
     createdAt: new Date().toISOString(),
+    updatedAt: null,
     doneAt: null,
   };
 }
@@ -186,6 +263,7 @@ export function toggleTask(id) {
     const before = { done: t.done, status: t.status, doneAt: t.doneAt };
     const now = !t.done;
     t.done = now;
+    t.updatedAt = new Date().toISOString();
     t.status = now ? 'COMPLETE' : 'READY';
     t.doneAt = now ? new Date().toISOString() : null;
     // Lifetime counter: matches count of `toggle && done` events over history,
@@ -231,7 +309,7 @@ export function updateTask(id, patch) {
     if (!t) return null;
     const before = { text: t.text, project: t.project, priority: t.priority, due: t.due, code: t.code };
     const projChanged = 'project' in patch && patch.project !== t.project;
-    Object.assign(t, patch);
+    Object.assign(t, patch, { updatedAt: new Date().toISOString() });
     if (projChanged) t.code = nextCode(data, patch.project, cfg);
     save(data);
     logEventUnlocked({ type: 'edit', id, before, after: { ...patch, code: t.code } });

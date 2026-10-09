@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { writeAtomic } from './io.js';
+import { writeAtomic, ensureDownloaded } from './io.js';
 
 const DIR = join(homedir(), '.joi-todo');
 const FILE = join(DIR, 'config.json');
@@ -19,7 +19,7 @@ const DEFAULT = {
 
 function ensure() {
   if (!existsSync(DIR)) mkdirSync(DIR, { recursive: true });
-  if (!existsSync(FILE)) writeAtomic(FILE, JSON.stringify(DEFAULT, null, 2));
+  if (!ensureDownloaded(FILE)) writeAtomic(FILE, JSON.stringify(DEFAULT, null, 2));
 }
 
 export function loadConfig() {
