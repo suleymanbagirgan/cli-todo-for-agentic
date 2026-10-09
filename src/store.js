@@ -1,107 +1,108 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, readdirSync, unlinkSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+// Storage model (v2): every device appends only to its own op log
+// (ops/<deviceId>.jsonl) and never touches another device's file, so iCloud
+// never has two writers on one file. State = snapshot.json + all op logs
+// replayed in (ts, device, seq) order.
+//
+// Identity: task ids are `createdMs * 16 + deviceSlot`, unique without any
+// coordination. Codes (AX-17) stay human-readable; if two devices claim the
+// same code while offline, the lower-slot device keeps it and the other
+// shows it with its slot letter (AX-17b). Slot 0 codes never change.
+import { readFileSync, existsSync, mkdirSync, appendFileSync, readdirSync, renameSync, statSync } from 'node:fs';
+import { homedir, tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { loadConfig, catByProject } from './config.js';
 import { writeAtomic, withLock, ensureDownloaded } from './io.js';
 
 const DIR = join(homedir(), '.joi-todo');
-const FILE = join(DIR, 'tasks.json');
-const LOG = join(DIR, 'events.jsonl');
-// Lock lives in OS tmpdir (never synced by iCloud/Dropbox) to avoid
-// ghost locks between devices when the data dir is a synced symlink.
+const OPS_DIR = join(DIR, 'ops');
+const DEVICES_DIR = join(DIR, 'devices');
+const LEGACY_DIR = join(DIR, 'legacy');
+const SNAPSHOT = join(DIR, 'snapshot.json');
+const LEGACY_TASKS = join(DIR, 'tasks.json');
+const LEGACY_EVENTS = join(DIR, 'events.jsonl');
+const LOCAL_DIR = join(homedir(), '.joi-todo-local');
+const DEVICE_FILE = join(LOCAL_DIR, 'device.json');
+// Lock lives in OS tmpdir (never synced) — it only serializes processes on
+// this machine; cross-device safety comes from one-writer-per-file.
 const LOCK = join(tmpdir(), 'joi-todo.lock');
-// iCloud names the losing side of a cross-device write conflict "tasks 2.json".
-const CONFLICT_TASKS = /^tasks \d+\.json$/;
-const CONFLICT_EVENTS = /^events \d+\.jsonl$/;
 
-function ensure() {
-  if (!existsSync(DIR)) mkdirSync(DIR, { recursive: true });
-  if (!ensureDownloaded(FILE)) writeAtomic(FILE, JSON.stringify({ tasks: [], nextId: 1, stats: { completed: 0 } }, null, 2));
-  if (!ensureDownloaded(LOG)) writeFileSync(LOG, '');
-}
+const ID_SLOTS = 16;
+const SLOT_LETTERS = 'abcdefghijklmnop';
+const STRAY_TASKS = /^tasks( \d+)?\.json$/;
+const STRAY_EVENTS = /^events( \d+)?\.jsonl$/;
+const ICLOUD_PLACEHOLDER = /^\.(.+)\.icloud$/;
 
-function tx(fn) {
-  return withLock(LOCK, () => {
-    resolveConflicts();
-    return fn();
+export const STATUS = { READY: 'READY', ACTIVE: 'ACTIVE', HOLD: 'HOLD', COMPLETE: 'COMPLETE' };
+
+// ── files ───────────────────────────────────────────────────────────────
+
+function listFiles(dir, pattern) {
+  let names;
+  try { names = readdirSync(dir); } catch { return []; }
+  const real = new Set(names.filter((n) => pattern.test(n)));
+  for (const n of names) {
+    const m = ICLOUD_PLACEHOLDER.exec(n);
+    if (m && pattern.test(m[1])) real.add(m[1]);
+  }
+  return [...real].sort().map((n) => {
+    const path = join(dir, n);
+    ensureDownloaded(path);
+    return path;
   });
 }
 
-const touchedAt = (t) => t.updatedAt || t.doneAt || t.createdAt || '';
-
-function reconcileCounters(data, tasks) {
-  data.categoryCounters = data.categoryCounters || {};
-  for (const t of tasks) {
-    const m = /^([A-Z]+)-(\d+)$/.exec(t.code || '');
-    if (!m) continue;
-    const n = Number(m[2]);
-    if (n > (data.categoryCounters[m[1]] || 0)) data.categoryCounters[m[1]] = n;
-  }
+function readJsonl(path) {
+  let raw;
+  try { raw = readFileSync(path, 'utf8'); } catch { return []; }
+  // A line can be half-synced from another device; skip it until it lands.
+  return raw.split('\n').flatMap((line) => {
+    if (!line.trim()) return [];
+    try { return [JSON.parse(line)]; } catch { return []; }
+  });
 }
 
-// Same id + same createdAt → same task, newest edit wins. Same id but a
-// different createdAt → both devices added a task concurrently, so the
-// incoming one gets a fresh id and code instead of being dropped.
-function mergeTasks(data, other, cfg) {
-  const byId = new Map(data.tasks.map((t) => [t.id, t]));
-  const incoming = [];
-  for (const t of other.tasks || []) {
-    const mine = byId.get(t.id);
-    if (!mine) incoming.push({ ...t });
-    else if (mine.createdAt !== t.createdAt) incoming.push({ ...t, id: null });
-    else if (touchedAt(t) > touchedAt(mine)) Object.assign(mine, t);
-  }
-  reconcileCounters(data, [...data.tasks, ...incoming]);
-  const usedCodes = new Set(data.tasks.map((t) => t.code).filter(Boolean));
-  let maxId = Math.max(0, ...data.tasks.map((t) => t.id || 0), ...incoming.map((t) => t.id || 0));
-  for (const t of incoming) {
-    if (t.id === null) t.id = ++maxId;
-    if (!t.code || usedCodes.has(t.code)) t.code = nextCode(data, t.project, cfg);
-    usedCodes.add(t.code);
-    data.tasks.push(t);
-  }
-  data.tasks.sort((a, b) => a.id - b.id);
-  data.nextId = Math.max(data.nextId || 1, other.nextId || 1, maxId + 1);
-  data.stats = { completed: Math.max(data.stats?.completed || 0, other.stats?.completed || 0) };
+function readJson(path) {
+  ensureDownloaded(path);
+  try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
 }
 
-function resolveConflicts() {
-  let names;
-  try { names = readdirSync(DIR); } catch { return; }
-  const taskCopies = names.filter((n) => CONFLICT_TASKS.test(n));
-  const eventCopies = names.filter((n) => CONFLICT_EVENTS.test(n));
-  if (taskCopies.length === 0 && eventCopies.length === 0) return;
-  ensure();
+// ── device identity ─────────────────────────────────────────────────────
 
-  if (taskCopies.length) {
-    const data = JSON.parse(readFileSync(FILE, 'utf8'));
-    const cfg = loadConfig();
-    const merged = [];
-    for (const name of taskCopies) {
-      const path = join(DIR, name);
-      try {
-        mergeTasks(data, JSON.parse(readFileSync(path, 'utf8')), cfg);
-        merged.push(path);
-      } catch {}
-    }
-    writeAtomic(FILE, JSON.stringify(data, null, 2));
-    for (const path of merged) unlinkSync(path);
-  }
+let deviceCache = null;
 
-  if (eventCopies.length) {
-    const lines = new Set(readFileSync(LOG, 'utf8').split('\n').filter(Boolean));
-    for (const name of eventCopies) {
-      const path = join(DIR, name);
-      for (const line of readFileSync(path, 'utf8').split('\n')) if (line) lines.add(line);
-      unlinkSync(path);
-    }
-    const sorted = [...lines]
-      .map((line) => { try { return { line, ts: JSON.parse(line).ts || '' }; } catch { return null; } })
-      .filter(Boolean)
-      .sort((a, b) => a.ts.localeCompare(b.ts));
-    writeAtomic(LOG, sorted.map((e) => e.line).join('\n') + '\n');
-  }
+function listDevices() {
+  return listFiles(DEVICES_DIR, /\.json$/).map(readJson).filter(Boolean);
 }
+
+function device() {
+  if (deviceCache) return deviceCache;
+  mkdirSync(LOCAL_DIR, { recursive: true });
+  mkdirSync(DEVICES_DIR, { recursive: true });
+  let local = readJson(DEVICE_FILE);
+  if (!local?.id) {
+    local = { id: randomBytes(4).toString('hex') };
+    writeAtomic(DEVICE_FILE, JSON.stringify(local, null, 2));
+  }
+  const regPath = join(DEVICES_DIR, `${local.id}.json`);
+  let reg = readJson(regPath);
+  const others = listDevices().filter((d) => d.id !== local.id);
+  const outranks = (d) => d.registeredAt < reg.registeredAt || (d.registeredAt === reg.registeredAt && d.id < reg.id);
+  // Two devices that registered while offline can pick the same slot; the
+  // later registration moves. Ids already issued stay unique (distinct ms).
+  if (!reg || others.some((d) => d.slot === reg.slot && outranks(d))) {
+    const used = new Set(others.map((d) => d.slot));
+    let slot = 0;
+    while (used.has(slot)) slot += 1;
+    if (slot >= ID_SLOTS) throw new Error(`en fazla ${ID_SLOTS} cihaz desteklenir`);
+    reg = { id: local.id, name: hostname(), slot, registeredAt: reg?.registeredAt || new Date().toISOString() };
+    writeAtomic(regPath, JSON.stringify(reg, null, 2));
+  }
+  deviceCache = reg;
+  return reg;
+}
+
+// ── migration from v1 (single shared tasks.json) ────────────────────────
 
 function migrateTask(t) {
   if ('tag' in t && !('project' in t)) {
@@ -117,13 +118,230 @@ function migrateTask(t) {
   return t;
 }
 
-function nextCode(data, project, cfg) {
-  const catMap = catByProject(cfg);
-  const cat = catMap.get(project) || 'OT';
-  data.categoryCounters = data.categoryCounters || {};
-  data.categoryCounters[cat] = (data.categoryCounters[cat] || 0) + 1;
-  return `${cat}-${data.categoryCounters[cat]}`;
+function stamp() {
+  return new Date().toISOString().replace(/[:.]/g, '-');
 }
+
+function moveToLegacy(path, name) {
+  mkdirSync(LEGACY_DIR, { recursive: true });
+  try { renameSync(path, join(LEGACY_DIR, name)); } catch {}
+}
+
+function migrateIfNeeded() {
+  mkdirSync(OPS_DIR, { recursive: true });
+  if (ensureDownloaded(SNAPSHOT)) return;
+  ensureDownloaded(LEGACY_TASKS);
+  const base = readJson(LEGACY_TASKS) || { tasks: [], stats: { completed: 0 } };
+  writeAtomic(SNAPSHOT, JSON.stringify({
+    version: 2,
+    createdAt: new Date().toISOString(),
+    tasks: (base.tasks || []).map((t) => migrateTask({ ...t })),
+    stats: { completed: base.stats?.completed || 0 },
+    categoryCounters: base.categoryCounters || {},
+  }, null, 2));
+  if (existsSync(LEGACY_TASKS)) moveToLegacy(LEGACY_TASKS, 'tasks.json');
+  if (ensureDownloaded(LEGACY_EVENTS)) moveToLegacy(LEGACY_EVENTS, 'events.jsonl');
+}
+
+// ── replay ──────────────────────────────────────────────────────────────
+
+function opOrder(a, b) {
+  return a.ts - b.ts || (a.dev < b.dev ? -1 : a.dev > b.dev ? 1 : 0) || a.seq - b.seq;
+}
+
+function fold() {
+  migrateIfNeeded();
+  const dev = device();
+  const snap = readJson(SNAPSHOT) || { tasks: [], stats: { completed: 0 } };
+  const tasks = new Map(snap.tasks.map((t) => [t.id, migrateTask({ ...t })]));
+  const counters = { ...(snap.categoryCounters || {}) };
+  let completed = snap.stats?.completed || 0;
+
+  const ops = listFiles(OPS_DIR, /\.jsonl$/).flatMap(readJsonl).sort(opOrder);
+  let own = { seq: 0, ts: 0 };
+
+  for (const op of ops) {
+    if (op.dev === dev.id) own = { seq: Math.max(own.seq, op.seq), ts: Math.max(own.ts, op.ts) };
+    const t = tasks.get(op.id);
+    switch (op.op) {
+      case 'create':
+        if (tasks.has(op.id)) break;
+        tasks.set(op.id, migrateTask({ ...op.task }));
+        if (op.task.done) completed += 1;
+        break;
+      case 'set': {
+        if (!t) break;
+        const wasDone = t.done;
+        Object.assign(t, op.fields);
+        if (!wasDone && t.done) completed += 1;
+        if (wasDone && !t.done && op.undoes) completed -= 1;
+        break;
+      }
+      case 'inc':
+        if (t) t[op.field] = (t[op.field] || 0) + op.by;
+        break;
+      case 'delete':
+        if (t) t.deleted = true;
+        break;
+    }
+  }
+
+  const all = [...tasks.values()];
+  reconcileCounters(counters, all);
+  const slots = new Map(listDevices().map((d) => [d.id, d.slot]));
+  return { tasks, all, ops, own, dev, counters, completed: Math.max(0, completed), slots };
+}
+
+function reconcileCounters(counters, tasks) {
+  for (const t of tasks) {
+    const m = /^([A-Z]+)-(\d+)$/.exec(t.code || '');
+    if (!m) continue;
+    const n = Number(m[2]);
+    if (n > (counters[m[1]] || 0)) counters[m[1]] = n;
+  }
+}
+
+// Display codes: the lowest (slot, createdAt, id) keeps the code as is.
+function displayTasks(state) {
+  const live = state.all.filter((t) => !t.deleted).map((t) => ({ ...t }));
+  const byCode = new Map();
+  for (const t of live) {
+    if (!t.code) continue;
+    if (!byCode.has(t.code)) byCode.set(t.code, []);
+    byCode.get(t.code).push(t);
+  }
+  const slotOf = (t) => state.slots.get(t.origin) ?? 0;
+  for (const group of byCode.values()) {
+    if (group.length < 2) continue;
+    group.sort((a, b) => slotOf(a) - slotOf(b) || String(a.createdAt).localeCompare(String(b.createdAt)) || a.id - b.id);
+    const taken = new Set([group[0].code]);
+    for (const t of group.slice(1)) {
+      let code = `${t.code}${SLOT_LETTERS[slotOf(t)]}`;
+      for (let i = 2; taken.has(code); i += 1) code = `${t.code}${SLOT_LETTERS[slotOf(t)]}${i}`;
+      taken.add(code);
+      t.code = code;
+    }
+  }
+  return live.sort((a, b) => a.id - b.id);
+}
+
+function view(state) {
+  return { tasks: displayTasks(state), stats: { completed: state.completed } };
+}
+
+// ── writes ──────────────────────────────────────────────────────────────
+
+function commit(state, ops) {
+  const file = join(OPS_DIR, `${state.dev.id}.jsonl`);
+  ensureDownloaded(file);
+  const batch = ops.length > 1 ? randomBytes(4).toString('hex') : undefined;
+  const lines = ops.map((op) => {
+    state.own = { seq: state.own.seq + 1, ts: Math.max(Date.now(), state.own.ts) };
+    const full = { ...op, ts: state.own.ts, dev: state.dev.id, seq: state.own.seq, ...(batch && { batch }) };
+    applyLocal(state, full);
+    return JSON.stringify(full);
+  });
+  appendFileSync(file, lines.join('\n') + '\n');
+}
+
+function applyLocal(state, op) {
+  state.ops.push(op);
+  const t = state.tasks.get(op.id);
+  if (op.op === 'create') {
+    const task = migrateTask({ ...op.task });
+    state.tasks.set(op.id, task);
+    state.all.push(task);
+    reconcileCounters(state.counters, [task]);
+    if (task.done) state.completed += 1;
+  } else if (op.op === 'set' && t) {
+    const wasDone = t.done;
+    Object.assign(t, op.fields);
+    if (!wasDone && t.done) state.completed += 1;
+    if (wasDone && !t.done && op.undoes) state.completed -= 1;
+    reconcileCounters(state.counters, [t]);
+  } else if (op.op === 'inc' && t) {
+    t[op.field] = (t[op.field] || 0) + op.by;
+  } else if (op.op === 'delete' && t) {
+    t.deleted = true;
+  }
+}
+
+function tx(fn) {
+  return withLock(LOCK, () => {
+    const state = fold();
+    absorbStrays(state);
+    return fn(state);
+  });
+}
+
+function newId(state) {
+  let id = Date.now() * ID_SLOTS + state.dev.slot;
+  while (state.tasks.has(id)) id += ID_SLOTS;
+  return id;
+}
+
+function nextCode(state, project, cfg) {
+  const cat = catByProject(cfg).get(project) || 'OT';
+  state.counters[cat] = (state.counters[cat] || 0) + 1;
+  return `${cat}-${state.counters[cat]}`;
+}
+
+function pick(obj, keys) {
+  return Object.fromEntries(keys.map((k) => [k, obj[k] ?? null]));
+}
+
+function setFields(state, t, fields) {
+  const stamped = { ...fields, updatedAt: new Date().toISOString() };
+  commit(state, [{ op: 'set', id: t.id, fields: stamped, prev: pick(t, Object.keys(stamped)) }]);
+  return shown(state, t);
+}
+
+function shown(state, t) {
+  return displayTasks(state).find((x) => x.id === t.id) || { ...t };
+}
+
+const touchedAt = (t) => t.updatedAt || t.doneAt || t.createdAt || '';
+const SYNCED_FIELDS = ['text', 'project', 'priority', 'due', 'status', 'done', 'doneAt', 'timeSpent'];
+
+// An outdated client (or an iCloud conflict copy) may still write a v1
+// tasks.json. Fold anything new or newer from it into this device's log,
+// then park the file in legacy/ so it is absorbed exactly once.
+function absorbStrays(state) {
+  const strays = listFiles(DIR, STRAY_TASKS);
+  const strayEvents = listFiles(DIR, STRAY_EVENTS);
+  if (strays.length === 0 && strayEvents.length === 0) return;
+  const cfg = loadConfig();
+  const ops = [];
+  const created = [];
+  for (const path of strays) {
+    const data = readJson(path);
+    if (!data) continue;
+    for (const raw of data.tasks || []) {
+      const t = migrateTask({ ...raw });
+      const mine = state.tasks.get(t.id);
+      if (mine && mine.createdAt === t.createdAt) {
+        if (touchedAt(t) <= touchedAt(mine)) continue;
+        const fields = Object.fromEntries(SYNCED_FIELDS.filter((k) => t[k] !== mine[k]).map((k) => [k, t[k]]));
+        if (Object.keys(fields).length) ops.push({ op: 'set', id: t.id, fields, prev: pick(mine, Object.keys(fields)), kind: 'absorb' });
+        continue;
+      }
+      const known = [...state.all, ...created];
+      if (known.some((x) => x.createdAt === t.createdAt && x.text === t.text)) continue;
+      const id = newId(state);
+      const taken = known.some((x) => x.code === t.code);
+      const task = { ...t, id, origin: state.dev.id, code: !t.code || taken ? nextCode(state, t.project, cfg) : t.code };
+      state.tasks.set(id, task);
+      created.push(task);
+      ops.push({ op: 'create', id, task, kind: 'absorb' });
+    }
+  }
+  for (const path of strays) moveToLegacy(path, `absorbed-${stamp()}-${path.split('/').pop()}`);
+  for (const path of strayEvents) moveToLegacy(path, `events-${stamp()}.jsonl`);
+  for (const op of ops) if (op.op === 'create') state.tasks.delete(op.id);
+  if (ops.length) commit(state, ops);
+}
+
+// ── public API ──────────────────────────────────────────────────────────
 
 export function findTask(data, ref) {
   if (ref === null || ref === undefined || ref === '') return null;
@@ -136,89 +354,13 @@ export function findTask(data, ref) {
   return data.tasks.find((t) => t.code && t.code.toUpperCase() === upper);
 }
 
-export const STATUS = { READY: 'READY', ACTIVE: 'ACTIVE', HOLD: 'HOLD', COMPLETE: 'COMPLETE' };
-
-export function addTimeSpent(id, seconds) {
-  if (!seconds || seconds <= 0) return null;
-  return tx(() => {
-    const data = loadRaw();
-    const t = data.tasks.find((x) => x.id === id);
-    if (!t) return null;
-    t.timeSpent = (t.timeSpent || 0) + seconds;
-    t.updatedAt = new Date().toISOString();
-    save(data);
-    return t;
-  });
-}
-
-export function setStatus(id, status) {
-  return tx(() => {
-    const data = loadRaw();
-    const t = data.tasks.find((x) => x.id === id);
-    if (!t) return null;
-    const before = t.status;
-    t.status = status;
-    t.updatedAt = new Date().toISOString();
-    t.done = status === 'COMPLETE';
-    t.doneAt = status === 'COMPLETE' ? new Date().toISOString() : null;
-    save(data);
-    logEventUnlocked({ type: 'status', id, before, after: status });
-    return t;
-  });
-}
-
-function loadRaw() {
-  ensure();
-  const data = JSON.parse(readFileSync(FILE, 'utf8'));
-  data.tasks = data.tasks.map((t) => migrateTask({ ...t }));
-  const maxId = data.tasks.reduce((m, t) => Math.max(m, t.id || 0), 0);
-  data.nextId = Math.max(data.nextId || 1, maxId + 1);
-  reconcileCounters(data, data.tasks);
-  // Reconcile lifetime completed counter. If missing or stale (e.g. edited
-  // externally), recompute from events once so the header stays accurate.
-  if (!data.stats || typeof data.stats.completed !== 'number') {
-    data.stats = { completed: 0 };
-    try {
-      const raw = readFileSync(LOG, 'utf8').trim();
-      if (raw) {
-        for (const line of raw.split('\n')) {
-          const e = JSON.parse(line);
-          if (e.type === 'toggle' && e.done) data.stats.completed += 1;
-        }
-      }
-    } catch {}
-  }
-  return data;
-}
-
 export function load() {
-  return tx(loadRaw);
+  return tx(view);
 }
 
-export function save(data) {
-  ensure();
-  writeAtomic(FILE, JSON.stringify(data, null, 2));
-}
-
-function logEventUnlocked(event) {
-  ensure();
-  appendFileSync(LOG, JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n');
-}
-
-export function logEvent(event) {
-  return tx(() => logEventUnlocked(event));
-}
-
-export function readEvents() {
-  ensure();
-  const raw = readFileSync(LOG, 'utf8').trim();
-  if (!raw) return [];
-  return raw.split('\n').map((line) => JSON.parse(line));
-}
-
-function writeEvents(events) {
-  ensure();
-  writeAtomic(LOG, events.map((e) => JSON.stringify(e)).join('\n') + (events.length ? '\n' : ''));
+function liveTask(state, id) {
+  const t = state.tasks.get(id);
+  return t && !t.deleted ? t : null;
 }
 
 function makeTask({ text, project = null, priority = 0, due = null }) {
@@ -239,18 +381,10 @@ function makeTask({ text, project = null, priority = 0, due = null }) {
 }
 
 export function addTask(parsed) {
-  return tx(() => {
-    const data = loadRaw();
-    const cfg = loadConfig();
-    const task = makeTask(parsed);
-    const usedIds = new Set(data.tasks.map((t) => t.id));
-    while (usedIds.has(data.nextId)) data.nextId += 1;
-    task.id = data.nextId;
-    task.code = nextCode(data, parsed.project, cfg);
-    data.tasks.push(task);
-    data.nextId += 1;
-    save(data);
-    logEventUnlocked({ type: 'add', task: { ...task } });
+  return tx((state) => {
+    const task = { ...makeTask(parsed), id: newId(state), origin: state.dev.id };
+    task.code = nextCode(state, parsed.project, loadConfig());
+    commit(state, [{ op: 'create', id: task.id, task }]);
     return task;
   });
 }
@@ -258,15 +392,14 @@ export function addTask(parsed) {
 // Records finished work captured from an agent session. `meta.turnId`
 // makes it idempotent: replaying the same transcript never duplicates.
 export function logWork({ text, project = null, meta }) {
-  return tx(() => {
-    const data = loadRaw();
-    const existing = data.tasks.find((t) => t.meta?.turnId === meta.turnId);
+  return tx((state) => {
+    const existing = state.all.find((t) => t.meta?.turnId === meta.turnId);
     if (existing) return existing;
-    const cfg = loadConfig();
     const now = new Date().toISOString();
     const task = {
       ...makeTask({ text, project }),
-      id: Math.max(data.nextId, ...data.tasks.map((t) => t.id + 1)),
+      id: newId(state),
+      origin: state.dev.id,
       status: 'COMPLETE',
       done: true,
       createdAt: meta.startedAt || now,
@@ -274,140 +407,119 @@ export function logWork({ text, project = null, meta }) {
       source: 'agent',
       meta,
     };
-    task.code = nextCode(data, project, cfg);
-    data.tasks.push(task);
-    data.nextId = task.id + 1;
-    data.stats = data.stats || { completed: 0 };
-    data.stats.completed += 1;
-    save(data);
-    logEventUnlocked({ type: 'worklog', task: { ...task } });
+    task.code = nextCode(state, project, loadConfig());
+    commit(state, [{ op: 'create', id: task.id, task, kind: 'worklog' }]);
     return task;
   });
 }
 
 export function toggleTask(id) {
-  return tx(() => {
-    const data = loadRaw();
-    const t = data.tasks.find((x) => x.id === id);
+  return tx((state) => {
+    const t = liveTask(state, id);
     if (!t) return null;
-    const before = { done: t.done, status: t.status, doneAt: t.doneAt };
     const now = !t.done;
-    t.done = now;
-    t.updatedAt = new Date().toISOString();
-    t.status = now ? 'COMPLETE' : 'READY';
-    t.doneAt = now ? new Date().toISOString() : null;
-    // Lifetime counter: matches count of `toggle && done` events over history,
-    // so cycles (complete → uncomplete → complete) count each completion.
-    if (now) {
-      data.stats = data.stats || { completed: 0 };
-      data.stats.completed += 1;
-    }
-    save(data);
-    logEventUnlocked({ type: 'toggle', id, done: t.done, status: t.status, before });
-    return t;
+    return setFields(state, t, {
+      done: now,
+      status: now ? 'COMPLETE' : 'READY',
+      doneAt: now ? new Date().toISOString() : null,
+    });
   });
 }
 
-export function removeTask(id) {
-  return tx(() => {
-    const data = loadRaw();
-    const idx = data.tasks.findIndex((x) => x.id === id);
-    if (idx === -1) return null;
-    const [removed] = data.tasks.splice(idx, 1);
-    save(data);
-    logEventUnlocked({ type: 'remove', task: removed });
-    return removed;
+export function setStatus(id, status) {
+  return tx((state) => {
+    const t = liveTask(state, id);
+    if (!t) return null;
+    return setFields(state, t, {
+      status,
+      done: status === 'COMPLETE',
+      doneAt: status === 'COMPLETE' ? new Date().toISOString() : null,
+    });
   });
 }
 
-export function clearDone() {
-  return tx(() => {
-    const data = loadRaw();
-    const removed = data.tasks.filter((x) => x.done);
-    data.tasks = data.tasks.filter((x) => !x.done);
-    save(data);
-    logEventUnlocked({ type: 'clear', tasks: removed });
-    return removed.length;
+// Increment, not overwrite: timers on two devices must add up, not race.
+export function addTimeSpent(id, seconds) {
+  if (!seconds || seconds <= 0) return null;
+  return tx((state) => {
+    const t = liveTask(state, id);
+    if (!t) return null;
+    commit(state, [{ op: 'inc', id, field: 'timeSpent', by: seconds }]);
+    return { ...t };
   });
 }
 
 export function updateTask(id, patch) {
-  return tx(() => {
-    const data = loadRaw();
-    const cfg = loadConfig();
-    const t = data.tasks.find((x) => x.id === id);
+  return tx((state) => {
+    const t = liveTask(state, id);
     if (!t) return null;
-    const before = { text: t.text, project: t.project, priority: t.priority, due: t.due, code: t.code };
-    const projChanged = 'project' in patch && patch.project !== t.project;
-    Object.assign(t, patch, { updatedAt: new Date().toISOString() });
-    if (projChanged) t.code = nextCode(data, patch.project, cfg);
-    save(data);
-    logEventUnlocked({ type: 'edit', id, before, after: { ...patch, code: t.code } });
-    return t;
+    const fields = { ...patch };
+    if ('project' in patch && patch.project !== t.project) fields.code = nextCode(state, patch.project, loadConfig());
+    return setFields(state, t, fields);
   });
 }
 
+export function removeTask(id) {
+  return tx((state) => {
+    const t = liveTask(state, id);
+    if (!t) return null;
+    const display = shown(state, t);
+    commit(state, [{ op: 'delete', id }]);
+    return display;
+  });
+}
+
+export function clearDone() {
+  return tx((state) => {
+    const done = state.all.filter((t) => !t.deleted && t.done);
+    if (done.length) commit(state, done.map((t) => ({ op: 'delete', id: t.id })));
+    return done.length;
+  });
+}
+
+const UNDO_TYPES = { create: 'add', set: 'edit', inc: 'edit', delete: 'remove' };
+
+// Undo walks back through this device's own ops only; the other device's
+// work is never rolled back from here.
 export function undoLast() {
-  return tx(() => {
-    const events = readEvents();
-    if (events.length === 0) return { ok: false, msg: 'geri alınacak bir şey yok' };
+  return tx((state) => {
+    const own = state.ops.filter((o) => o.dev === state.dev.id && o.op !== 'event' && o.kind !== 'absorb');
+    const undone = new Set(own.flatMap((o) => o.undoes || []));
+    const target = [...own].reverse().find((o) => !o.undoes && !undone.has(o.seq));
+    if (!target) return { ok: false, msg: 'geri alınacak bir şey yok' };
+    const group = target.batch ? own.filter((o) => o.batch === target.batch && !undone.has(o.seq)) : [target];
+    const undoes = group.map((o) => o.seq);
+    const inverse = group.reverse().map((o) => {
+      if (o.op === 'create') return { op: 'delete', id: o.id, undoes };
+      if (o.op === 'delete') return { op: 'set', id: o.id, fields: { deleted: false }, undoes };
+      if (o.op === 'inc') return { op: 'inc', id: o.id, field: o.field, by: -o.by, undoes };
+      return { op: 'set', id: o.id, fields: o.prev, undoes };
+    });
+    commit(state, inverse);
+    const type = target.kind === 'worklog' ? 'worklog' : target.op === 'set' && 'done' in target.fields ? 'toggle' : UNDO_TYPES[target.op];
+    return { ok: true, event: { type } };
+  });
+}
 
-    const last = events[events.length - 1];
-    const data = loadRaw();
+export function logEvent(event) {
+  return tx((state) => commit(state, [{ op: 'event', payload: event }]));
+}
 
-    switch (last.type) {
-      case 'add':
-      case 'worklog': {
-        const idx = data.tasks.findIndex((x) => x.id === last.task.id);
-        if (idx !== -1) data.tasks.splice(idx, 1);
-        if (data.nextId === last.task.id + 1) data.nextId = last.task.id;
-        break;
+// Events in the v1 shape (add/toggle/start/stop/...) for stats and reports.
+export function readEvents() {
+  return tx((state) => {
+    const legacy = listFiles(LEGACY_DIR, /^events.*\.jsonl$/).flatMap(readJsonl);
+    const fromOps = state.ops.flatMap((op) => {
+      const ts = new Date(op.ts).toISOString();
+      if (op.op === 'event') return [{ ts, ...op.payload }];
+      if (op.op === 'create') return [{ ts, type: op.kind === 'worklog' ? 'worklog' : 'add', task: op.task }];
+      if (op.op === 'set' && op.fields && 'done' in op.fields && op.fields.done !== op.prev?.done) {
+        return [{ ts, type: 'toggle', id: op.id, done: op.fields.done }];
       }
-      case 'remove': {
-        data.tasks.push(migrateTask({ ...last.task }));
-        data.tasks.sort((a, b) => a.id - b.id);
-        break;
-      }
-      case 'toggle': {
-        const t = data.tasks.find((x) => x.id === last.id);
-        if (t) {
-          if (last.before) {
-            // new format: restore explicit before-state
-            t.done = last.before.done;
-            t.status = last.before.status;
-            t.doneAt = last.before.doneAt ?? null;
-          } else {
-            // legacy fallback: flip
-            t.done = !t.done;
-            t.status = t.done ? 'COMPLETE' : 'READY';
-            t.doneAt = t.done ? new Date().toISOString() : null;
-          }
-        }
-        // Removing a completion event from the log means the lifetime
-        // count also drops by one; other toggle undos leave it alone.
-        if (last.done === true) {
-          data.stats = data.stats || { completed: 0 };
-          if (data.stats.completed > 0) data.stats.completed -= 1;
-        }
-        break;
-      }
-      case 'clear': {
-        data.tasks.push(...last.tasks.map((t) => migrateTask({ ...t })));
-        data.tasks.sort((a, b) => a.id - b.id);
-        break;
-      }
-      case 'edit': {
-        const t = data.tasks.find((x) => x.id === last.id);
-        if (t) Object.assign(t, last.before);
-        break;
-      }
-      default:
-        return { ok: false, msg: `geri alınamıyor: ${last.type}` };
-    }
-
-    save(data);
-    writeEvents(events.slice(0, -1));
-    return { ok: true, event: last };
+      if (op.op === 'delete') return [{ ts, type: 'remove', id: op.id }];
+      return [];
+    });
+    return [...legacy, ...fromOps].sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
   });
 }
 
@@ -434,4 +546,21 @@ export function stats() {
   };
 }
 
-export const paths = { DIR, FILE, LOG };
+// Cheap change signature for the TUI: any device appending to its log or a
+// snapshot rewrite changes it.
+export function dataVersion() {
+  let names;
+  try { names = readdirSync(OPS_DIR); } catch { return ''; }
+  return names.map((n) => {
+    try { const s = statSync(join(OPS_DIR, n)); return `${n}:${s.size}:${s.mtimeMs}`; } catch { return n; }
+  }).join('|');
+}
+
+export function deviceInfo() {
+  return withLock(LOCK, () => {
+    migrateIfNeeded();
+    return { self: device(), devices: listDevices() };
+  });
+}
+
+export const paths = { DIR, FILE: SNAPSHOT, LOG: OPS_DIR };

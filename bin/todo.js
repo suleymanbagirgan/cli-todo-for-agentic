@@ -9,7 +9,7 @@ import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { App } from '../src/App.js';
 import {
-  load, addTask, toggleTask, removeTask, clearDone, updateTask, undoLast, stats, paths, findTask, setStatus, STATUS,
+  load, addTask, toggleTask, removeTask, clearDone, updateTask, undoLast, stats, paths, findTask, setStatus, STATUS, deviceInfo,
 } from '../src/store.js';
 import { parseInput, formatDue, isOverdue } from '../src/parse.js';
 import { loadConfig, configPath, catByProject, getCategory, projectOrder, isCategoryLevel } from '../src/config.js';
@@ -45,6 +45,7 @@ const cli = meow(`
     $ todo sync                       iCloud sync durumu
     $ todo sync on|off                iCloud sync aç/kapat
     $ todo path                       veri dosyaları
+    $ todo devices                    senkronize cihazlar
 
   ${chalk.bold('Sözdizimi')}
     +proje          proje (klc, mighty, özaydın, ...)
@@ -279,7 +280,7 @@ async function main() {
       const data = load();
       const doneCount = data.tasks.filter((t) => t.done).length;
       if (doneCount === 0) { console.log(chalk.dim('temizlenecek bitmiş görev yok')); return; }
-      const yes = cli.input.includes('--yes') || cli.input.includes('-y');
+      const yes = Boolean(cli.flags.yes || cli.flags.y) || cli.input.includes('--yes') || cli.input.includes('-y');
       if (!yes) {
         if (!process.stdin.isTTY) {
           console.error(chalk.red(`${doneCount} bitmiş görev silinecek. Onay için: todo clear --yes`));
@@ -458,6 +459,15 @@ Kullanıcının sorusu: ${question}`;
         process.exit(1);
       });
       claude.on('exit', (code) => process.exit(code ?? 0));
+      return;
+    }
+    case 'devices': {
+      const { self, devices } = deviceInfo();
+      for (const d of devices.sort((a, b) => a.slot - b.slot)) {
+        const mark = d.id === self.id ? chalk.green('● bu cihaz') : chalk.dim('○');
+        const suffix = d.slot === 0 ? 'kodlar sabit' : `çakışmada kod sonu "${'abcdefghijklmnop'[d.slot]}"`;
+        console.log(`  ${mark}  ${chalk.bold(d.name)}  ${chalk.dim(`slot ${d.slot} · ${d.id} · ${suffix}`)}`);
+      }
       return;
     }
     case 'path': {

@@ -2,11 +2,11 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Box, Text, useInput, useApp, useStdout } from 'ink';
 import { ScrollView } from 'ink-scroll-view';
 import htm from 'htm';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { load, addTask, updateTask, undoLast, paths } from './store.js';
+import { load, addTask, updateTask, undoLast, dataVersion } from './store.js';
 import { Dashboard } from './Dashboard.js';
 import { manifestos as defaultManifestos } from './manifestos.js';
 
@@ -108,10 +108,9 @@ export function App() {
   };
 
   useEffect(() => {
-    const mtime = () => { try { return statSync(paths.FILE).mtimeMs; } catch { return 0; } };
-    let seen = mtime();
+    let seen = dataVersion();
     const iv = setInterval(() => {
-      const current = mtime();
+      const current = dataVersion();
       if (current !== seen) {
         seen = current;
         refresh();
